@@ -995,7 +995,10 @@ pub unsafe extern "C" fn sys_getsockopt(
 		},
 	);
 
-	*optlen = 0;
+	// Only clear the length on failure: callers (e.g. socket2) check it after success.
+	if result != 0 {
+		*optlen = 0;
+	}
 	result
 }
 

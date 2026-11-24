@@ -285,6 +285,13 @@ impl ObjectInterface for Socket {
 		self.with_context(|socket, cx| socket.connect(cx, endpoint, get_ephemeral_port()))
 			.map_err(|_| Errno::Io)?;
 
+		// Non-blocking connect: return immediately like POSIX; poll() reports POLLOUT once the
+		// handshake completes and SO_ERROR reports failure. Waiting here froze async runtimes
+		// (e.g. Tokio), for instance while a happy-eyeballs IPv6 attempt waited for its timeout.
+		if self.is_nonblocking {
+			return Err(Errno::Inprogress);
+		}
+
 		future::poll_fn(|cx| {
 			self.with(|socket| match socket.state() {
 				tcp::State::Closed | tcp::State::TimeWait => Poll::Ready(Err(Errno::Fault)),
