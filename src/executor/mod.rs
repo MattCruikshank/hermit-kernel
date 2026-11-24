@@ -221,8 +221,16 @@ where
 				core_local::core_scheduler().add_network_timer(
 					delay.map(|d| crate::arch::processor::get_timer_ticks() + d),
 				);
-				let wakeup_time =
-					timeout.map(|duration| start + u64::try_from(duration.as_micros()).unwrap());
+				// `TaskNotify::wait` takes a timeout *relative* to now (Flags::RELATIVE), but
+				// `start` is absolute wall-clock time; passing `start + timeout` made poll()
+				// timeouts effectively infinite. Pass the remaining time instead.
+				// (Fixed differently upstream in cee0d2fa, after 0.13.2.)
+				let wakeup_time = timeout.map(|duration| {
+					u64::try_from(duration.as_micros())
+						.unwrap()
+						.saturating_sub(now - start)
+						.max(1)
+				});
 
 				// switch to another task
 				task_notify.wait(wakeup_time);
@@ -241,8 +249,16 @@ where
 		#[cfg(not(feature = "net"))]
 		{
 			if backoff.is_completed() {
-				let wakeup_time =
-					timeout.map(|duration| start + u64::try_from(duration.as_micros()).unwrap());
+				// `TaskNotify::wait` takes a timeout *relative* to now (Flags::RELATIVE), but
+				// `start` is absolute wall-clock time; passing `start + timeout` made poll()
+				// timeouts effectively infinite. Pass the remaining time instead.
+				// (Fixed differently upstream in cee0d2fa, after 0.13.2.)
+				let wakeup_time = timeout.map(|duration| {
+					u64::try_from(duration.as_micros())
+						.unwrap()
+						.saturating_sub(now - start)
+						.max(1)
+				});
 
 				// switch to another task
 				task_notify.wait(wakeup_time);
