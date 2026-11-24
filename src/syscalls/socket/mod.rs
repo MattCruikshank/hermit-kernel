@@ -974,9 +974,8 @@ pub unsafe extern "C" fn sys_getsockopt(
 	optval: *mut c_void,
 	optlen: *mut socklen_t,
 ) -> i32 {
-	// SO_ERROR: async runtimes (mio/Tokio) check it after a non-blocking connect. Hermit's
-	// connect() completes or fails synchronously, so there is never a pending error.
-	// Without this, Tokio treated every successful connect as failed (EINVAL).
+	// SO_ERROR: async runtimes (mio/Tokio) check it after a non-blocking connect reports
+	// POLLOUT. Without it, Tokio treated every successful connect as failed (EINVAL).
 	if level == SOL_SOCKET && optname == SO_ERROR {
 		if optval.is_null() || optlen.is_null() {
 			return -i32::from(Errno::Inval);
@@ -984,11 +983,18 @@ pub unsafe extern "C" fn sys_getsockopt(
 		if unsafe { *optlen } < u32::try_from(size_of::<i32>()).unwrap() {
 			return -i32::from(Errno::Inval);
 		}
-		if let Err(e) = get_object(fd) {
-			return -i32::from(e);
-		}
+		let obj = match get_object(fd) {
+			Ok(obj) => obj,
+			Err(e) => return -i32::from(e),
+		};
+		// Only TCP tracks connection failures; other objects never have a pending error.
+		let failed = block_on(
+			async { obj.read().await.getsockopt(SocketOption::SoError).await },
+			None,
+		)
+		.unwrap_or(false);
 		unsafe {
-			*optval.cast::<i32>() = 0;
+			*optval.cast::<i32>() = if failed { i32::from(Errno::Connrefused) } else { 0 };
 			*optlen = size_of::<i32>().try_into().unwrap();
 		}
 		return 0;

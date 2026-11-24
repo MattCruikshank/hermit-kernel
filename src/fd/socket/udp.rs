@@ -62,8 +62,12 @@ impl Socket {
 								.map(|()| buffer.len())
 								.map_err(|_| Errno::Io),
 						)
+					} else if self.nonblocking {
+						// Non-blocking socket with a full send buffer: POSIX says EAGAIN.
+						Poll::Ready(Err(Errno::Again))
 					} else {
-						socket.register_recv_waker(cx.waker());
+						// Wait until the socket can send (this registered a recv waker before).
+						socket.register_send_waker(cx.waker());
 						Poll::Pending
 					}
 				} else {
@@ -179,6 +183,10 @@ impl ObjectInterface for Socket {
 							}
 							_ => Poll::Ready(Err(Errno::Io)),
 						}
+					} else if self.nonblocking {
+						// Non-blocking socket without data: POSIX says EAGAIN. Waiting here
+						// stalled async runtimes (e.g. Tokio's STUN client in tailscale-rs).
+						Poll::Ready(Err(Errno::Again))
 					} else {
 						socket.register_recv_waker(cx.waker());
 						Poll::Pending
@@ -211,6 +219,10 @@ impl ObjectInterface for Socket {
 							}
 							_ => Poll::Ready(Err(Errno::Io)),
 						}
+					} else if self.nonblocking {
+						// Non-blocking socket without data: POSIX says EAGAIN. Waiting here
+						// stalled async runtimes (e.g. Tokio's STUN client in tailscale-rs).
+						Poll::Ready(Err(Errno::Again))
 					} else {
 						socket.register_recv_waker(cx.waker());
 						Poll::Pending

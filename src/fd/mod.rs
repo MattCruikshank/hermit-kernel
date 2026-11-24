@@ -47,6 +47,8 @@ pub(crate) enum ListenEndpoint {
 #[derive(Debug, PartialEq)]
 pub(crate) enum SocketOption {
 	TcpNoDelay,
+	/// `SO_ERROR`: whether a started connection attempt has failed (get only).
+	SoError,
 }
 
 pub(crate) type RawFd = i32;

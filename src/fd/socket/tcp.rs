@@ -32,6 +32,8 @@ pub struct Socket {
 	endpoint: IpEndpoint,
 	is_nonblocking: bool,
 	is_listen: bool,
+	/// A connection attempt was started (for `SO_ERROR` after a non-blocking connect).
+	connect_started: bool,
 }
 
 impl Socket {
@@ -52,6 +54,7 @@ impl Socket {
 			endpoint,
 			is_nonblocking: false,
 			is_listen: false,
+			connect_started: false,
 		}
 	}
 
@@ -283,6 +286,14 @@ impl ObjectInterface for Socket {
 
 		self.with_context(|socket, cx| socket.connect(cx, endpoint, get_ephemeral_port()))
 			.map_err(|_| Errno::Io)?;
+		self.connect_started = true;
+
+		// Non-blocking connect: return immediately like POSIX; poll() reports POLLOUT once the
+		// handshake completes and SO_ERROR reports failure. Blocking here (as before) froze
+		// async runtimes, e.g. while a happy-eyeballs IPv6 attempt waited for its timeout.
+		if self.is_nonblocking {
+			return Err(Errno::Inprogress);
+		}
 
 		future::poll_fn(|cx| {
 			self.with(|socket| match socket.state() {
@@ -357,6 +368,7 @@ impl ObjectInterface for Socket {
 			endpoint: self.endpoint,
 			is_nonblocking: self.is_nonblocking,
 			is_listen: false,
+			connect_started: true,
 		};
 
 		Ok((Arc::new(async_lock::RwLock::new(socket)), endpoint))
@@ -429,6 +441,16 @@ impl ObjectInterface for Socket {
 	}
 
 	async fn getsockopt(&self, opt: SocketOption) -> io::Result<bool> {
+		if opt == SocketOption::SoError {
+			if !self.connect_started {
+				return Ok(false);
+			}
+			let mut guard = NIC.lock();
+			let nic = guard.as_nic_mut().unwrap();
+			let socket = nic.get_mut_socket::<tcp::Socket<'_>>(*self.handle.first().unwrap());
+			// A started connection that is closed again was refused, reset or timed out.
+			return Ok(matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait));
+		}
 		if opt == SocketOption::TcpNoDelay {
 			let mut guard = NIC.lock();
 			let nic = guard.as_nic_mut().unwrap();
