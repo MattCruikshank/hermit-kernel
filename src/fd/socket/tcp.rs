@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use core::future;
-use core::sync::atomic::{AtomicU16, Ordering};
+use super::get_ephemeral_port;
 use core::task::Poll;
 
 use async_trait::async_trait;
@@ -26,12 +26,6 @@ pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;
 /// The default queue size for incoming connections
 pub const DEFAULT_BACKLOG: i32 = 128;
-
-fn get_ephemeral_port() -> u16 {
-	static LOCAL_ENDPOINT: AtomicU16 = AtomicU16::new(49152);
-
-	LOCAL_ENDPOINT.fetch_add(1, Ordering::SeqCst)
-}
 
 pub struct Socket {
 	handle: BTreeSet<Handle>,

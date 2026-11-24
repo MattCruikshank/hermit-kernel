@@ -124,9 +124,14 @@ impl ObjectInterface for Socket {
 
 	async fn bind(&mut self, endpoint: ListenEndpoint) -> io::Result<()> {
 		#[allow(irrefutable_let_patterns)]
-		let ListenEndpoint::Ip(endpoint) = endpoint else {
+		let ListenEndpoint::Ip(mut endpoint) = endpoint else {
 			return Err(Errno::Io);
 		};
+
+		// Port 0 means "any free port" (POSIX); smoltcp can't bind port 0 itself.
+		if endpoint.port == 0 {
+			endpoint.port = super::get_ephemeral_port();
+		}
 
 		self.local_endpoint.port = endpoint.port;
 		if let Some(addr) = endpoint.addr {
