@@ -44,6 +44,23 @@ impl EventFd {
 	}
 }
 
+/// Enqueues the waker unless an equivalent one is already queued. `poll`-based multiplexing
+/// registers on every poll, so without this the queue grows with stale wakers.
+fn enqueue(queue: &mut VecDeque<Waker>, waker: &Waker) {
+	if !queue.iter().any(|w| w.will_wake(waker)) {
+		queue.push_back(waker.clone());
+	}
+}
+
+/// Wakes every queued waker. Waking only one (the oldest) lost wakeups: the oldest entry is
+/// often a stale waker left behind by a `poll` that already returned for another reason (e.g.
+/// a timeout), so the task actually waiting was never woken. (Upstream fixed this in 4820ad9e.)
+fn wake_all(queue: &mut VecDeque<Waker>) {
+	for waker in mem::take(queue) {
+		waker.wake();
+	}
+}
+
 #[async_trait]
 impl ObjectInterface for EventFd {
 	async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -60,12 +77,10 @@ impl ObjectInterface for EventFd {
 				if guard.counter > 0 {
 					guard.counter -= 1;
 					buf[..len].copy_from_slice(&u64::to_ne_bytes(1));
-					if let Some(cx) = guard.write_queue.pop_front() {
-						cx.wake_by_ref();
-					}
+					wake_all(&mut guard.write_queue);
 					Poll::Ready(Ok(len))
 				} else {
-					guard.read_queue.push_back(cx.waker().clone());
+					enqueue(&mut guard.read_queue, cx.waker());
 					Poll::Pending
 				}
 			} else {
@@ -75,14 +90,12 @@ impl ObjectInterface for EventFd {
 				if tmp > 0 {
 					guard.counter = 0;
 					buf[..len].copy_from_slice(&u64::to_ne_bytes(tmp));
-					if let Some(cx) = guard.read_queue.pop_front() {
-						cx.wake_by_ref();
-					}
+					wake_all(&mut guard.write_queue);
 					Poll::Ready(Ok(len))
 				} else if self.flags.contains(EventFlags::EFD_NONBLOCK) {
 					Poll::Ready(Err(Errno::Again))
 				} else {
-					guard.read_queue.push_back(cx.waker().clone());
+					enqueue(&mut guard.read_queue, cx.waker());
 					Poll::Pending
 				}
 			}
@@ -104,23 +117,13 @@ impl ObjectInterface for EventFd {
 			let mut guard = ready!(pinned.as_mut().poll(cx));
 			if u64::MAX - guard.counter > c {
 				guard.counter += c;
-				if self.flags.contains(EventFlags::EFD_SEMAPHORE) {
-					for _i in 0..c {
-						let Some(cx) = guard.read_queue.pop_front() else {
-							break;
-						};
-
-						cx.wake_by_ref();
-					}
-				} else if let Some(cx) = guard.read_queue.pop_front() {
-					cx.wake_by_ref();
-				}
+				wake_all(&mut guard.read_queue);
 
 				Poll::Ready(Ok(len))
 			} else if self.flags.contains(EventFlags::EFD_NONBLOCK) {
 				Poll::Ready(Err(Errno::Again))
 			} else {
-				guard.write_queue.push_back(cx.waker().clone());
+				enqueue(&mut guard.write_queue, cx.waker());
 				Poll::Pending
 			}
 		})
@@ -151,12 +154,12 @@ impl ObjectInterface for EventFd {
 				if event
 					.intersects(PollEvent::POLLIN | PollEvent::POLLRDNORM | PollEvent::POLLRDNORM)
 				{
-					guard.read_queue.push_back(cx.waker().clone());
+					enqueue(&mut guard.read_queue, cx.waker());
 					Poll::Pending
 				} else if event
 					.intersects(PollEvent::POLLOUT | PollEvent::POLLWRNORM | PollEvent::POLLWRBAND)
 				{
-					guard.write_queue.push_back(cx.waker().clone());
+					enqueue(&mut guard.write_queue, cx.waker());
 					Poll::Pending
 				} else {
 					Poll::Ready(Ok(ret))
