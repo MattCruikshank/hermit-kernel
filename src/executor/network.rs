@@ -265,11 +265,20 @@ pub(crate) fn wake_network_waker() {
 	}
 }
 
+/// When the network task re-queues itself (progress was made, or another core held the NIC),
+/// it must be polled again soon. The executor only runs from this core's idle loop, its
+/// interrupts and its scheduler passes — and while the device is in polling mode it raises no
+/// interrupts. A core busy with one CPU-bound thread and nothing else ready has none of those,
+/// so without a timer the whole network stack stalled until that thread stopped (seen as
+/// ~1.6 s stalls with Wasm guests spinning on every core). Re-arm a short timer instead.
+const REPOLL_US: u64 = 500;
+
 async fn network_run() {
 	future::poll_fn(|cx| {
 		let Some(mut guard) = NIC.try_lock() else {
 			// FIXME: only wake when progress can be made
 			cx.waker().wake_by_ref();
+			create_timer(Source::Network, REPOLL_US);
 			// another task is already using the NIC => don't check
 			return Poll::Pending;
 		};
@@ -283,6 +292,7 @@ async fn network_run() {
 		if nic.poll_common(now) == PollResult::SocketStateChanged || cfg!(feature = "idle-poll") {
 			// Progress was made or we want to poll when idle.
 			cx.waker().wake_by_ref();
+			create_timer(Source::Network, REPOLL_US);
 		} else {
 			// Very likely no progress can be made, so set up a timer interrupt to wake the waker
 			NETWORK_WAKER.lock().register(cx.waker());
