@@ -15,6 +15,7 @@ use memory_addresses::{PhysAddr, VirtAddr};
 #[cfg(target_arch = "x86_64")]
 use crate::arch::mm::paging::PageTableEntryFlagsExt;
 use crate::arch::mm::paging::{self, BasePageSize, PageSize, PageTableEntryFlags};
+use crate::errno::Errno;
 use crate::mm::{FrameAlloc, PageAlloc, PageRangeAllocator};
 
 bitflags! {
@@ -139,31 +140,43 @@ pub extern "C" fn sys_mprotect(ptr: *mut u8, size: usize, prot_flags: MemoryProt
 		.set_execute(prot_flags.contains(MemoryProtection::Exec));
 
 	let virtual_address = VirtAddr::from_ptr(ptr);
-
-	let (run_len, mapped) = contiguous_pages(virtual_address, count);
-	if run_len < count {
-		unimplemented!("mprotect on a partially mapped or non-contiguous range");
-	}
-
 	debug!("Mprotect {virtual_address:X} ({size}) -> {prot_flags:?})");
-	if let Some(physical_address) = mapped {
-		// Memory is already mapped
-		if prot_flags == MemoryProtection::None {
-			unimplemented!("mprotect to PROT_NONE is not yet supported");
+
+	// The range may consist of several runs of mapped and unmapped pages (e.g. a reservation
+	// that was made accessible piece by piece), so handle it run by run. Check first, so that a
+	// failing call changes nothing.
+	let mut virt = virtual_address;
+	let mut remaining = count;
+	while remaining > 0 {
+		let (run, mapped) = contiguous_pages(virt, remaining);
+		if mapped.is_some() && prot_flags == MemoryProtection::None {
+			// Making mapped memory inaccessible would need non-present entries that still own
+			// their frames; not supported yet.
+			return -i32::from(Errno::Nosys);
 		}
-		paging::map::<BasePageSize>(virtual_address, physical_address, count, flags);
-		0
-	} else if prot_flags == MemoryProtection::None {
-		// Unmapped memory stays reserved without frames
-		0
-	} else {
-		// Memory was not mapped but now becomes accessible
-		let frame_layout = PageLayout::from_size(size).unwrap();
-		let frame_range = FrameAlloc::allocate_zeroed(frame_layout).unwrap();
-		let physical_address = PhysAddr::from(frame_range.start());
-		paging::map::<BasePageSize>(virtual_address, physical_address, count, flags);
-		0
+		virt += (run * PAGE_SIZE) as u64;
+		remaining -= run;
 	}
+
+	let mut virt = virtual_address;
+	let mut remaining = count;
+	while remaining > 0 {
+		let (run, mapped) = contiguous_pages(virt, remaining);
+		if let Some(physical_address) = mapped {
+			// Memory is already mapped: change its flags.
+			paging::map::<BasePageSize>(virt, physical_address, run, flags);
+		} else if prot_flags != MemoryProtection::None {
+			// Reserved but unmapped memory becomes accessible: back it with zeroed frames.
+			let frame_layout = PageLayout::from_size(run * PAGE_SIZE).unwrap();
+			let frame_range = FrameAlloc::allocate_zeroed(frame_layout).unwrap();
+			let physical_address = PhysAddr::from(frame_range.start());
+			paging::map::<BasePageSize>(virt, physical_address, run, flags);
+		}
+		// Unmapped memory that stays inaccessible stays reserved without frames.
+		virt += (run * PAGE_SIZE) as u64;
+		remaining -= run;
+	}
+	0
 }
 
 #[hermit_macro::system(errno)]
