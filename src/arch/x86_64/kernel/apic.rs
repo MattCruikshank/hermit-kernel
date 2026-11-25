@@ -843,10 +843,14 @@ pub fn ipi_tlb_flush() {
 /// Send an inter-processor interrupt to wake up a CPU Core that is in a HALT state.
 #[allow(unused_variables)]
 pub fn wakeup_core(core_id_to_wakeup: CoreId) {
+	// With preemptive scheduling, a core that is busy (not halted) gets the IPI too: the task it
+	// runs may never yield, and the interrupt makes it pick up the woken task and arm its
+	// preemption timer (see `check_input`).
 	#[cfg(all(feature = "smp", not(feature = "idle-poll")))]
 	if core_id_to_wakeup != core_id()
-		&& !processor::supports_mwait()
-		&& scheduler::sleep_state::try_wake_up(core_id_to_wakeup)
+		&& ((!processor::supports_mwait()
+			&& scheduler::sleep_state::try_wake_up(core_id_to_wakeup))
+			|| cfg!(feature = "preemptive"))
 	{
 		let apic_ids = CPU_LOCAL_APIC_IDS.lock();
 		let local_apic_id = apic_ids[core_id_to_wakeup as usize];

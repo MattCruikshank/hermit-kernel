@@ -715,16 +715,35 @@ impl PerCoreScheduler {
 	#[cfg(feature = "smp")]
 	pub fn check_input(&mut self) {
 		let mut input_locked = CoreLocal::get().scheduler_input.lock();
+		#[cfg(feature = "preemptive")]
+		let mut added = false;
 
 		while let Some(task) = input_locked.wakeup_tasks.pop_front() {
 			if let Some(task) = self.blocked_tasks.custom_wakeup(task) {
 				self.ready_queue.push(task);
+				#[cfg(feature = "preemptive")]
+				{
+					added = true;
+				}
 			}
 		}
 
 		while let Some(new_task) = input_locked.new_tasks.pop_front() {
 			let task = Rc::new(RefCell::new(Task::from(new_task)));
 			self.ready_queue.push(task.clone());
+			#[cfg(feature = "preemptive")]
+			{
+				added = true;
+			}
+		}
+
+		// Tasks woken or created from another core are now ready here. As for a wakeup on this
+		// core (`custom_wakeup`), arm the preemption timer so that a running task that never
+		// yields is preempted soon and the newcomers get to run.
+		#[cfg(feature = "preemptive")]
+		if added {
+			let deadline = processor::get_timer_ticks() + PREEMPTION_SLICE_US;
+			timer_interrupts::create_timer_abs(timer_interrupts::Source::Preemption, deadline);
 		}
 	}
 
@@ -776,6 +795,12 @@ impl PerCoreScheduler {
 	pub fn scheduler(&mut self) -> Option<*mut usize> {
 		// run background tasks
 		crate::executor::run();
+
+		// Pick up tasks that other cores woke or created for this core. Without this, only the
+		// idle loop did so: a core that never went idle (a busy-waiting `usleep` below 10 ms,
+		// a compute-bound task) never saw them, and they starved forever.
+		#[cfg(feature = "smp")]
+		self.check_input();
 
 		// Someone wants to give up the CPU
 		// => we have time to cleanup the system
