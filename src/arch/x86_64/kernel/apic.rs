@@ -257,8 +257,18 @@ fn serve_tlb_shootdown() {
 /// interrupts disabled), and other cores acknowledge from the interrupt handler or the same
 /// polling. The caller must hold no lock that another core could be spinning on with
 /// interrupts disabled (true for the memory-mapping syscalls, which hold none here).
+///
+/// Runs with interrupts disabled from start to end: a task holding `SHOOTDOWN_LOCK` must never
+/// be preempted, or the scheduler on the same core (which shoots down when it frees a finished
+/// task's stacks) would spin on the lock forever — a whole-VM hang METAL's soak found. It also
+/// allocates nothing, since it runs inside the scheduler.
 #[cfg(feature = "smp")]
 pub fn tlb_shootdown() {
+	without_interrupts(tlb_shootdown_inner);
+}
+
+#[cfg(feature = "smp")]
+fn tlb_shootdown_inner() {
 	use core::sync::atomic::Ordering::SeqCst;
 	flush_local_tlb();
 	let cores = arch::kernel::get_processor_count();
@@ -274,7 +284,7 @@ pub fn tlb_shootdown() {
 		spin_loop();
 	}
 	let me = core_id();
-	let apic_ids = CPU_LOCAL_APIC_IDS.lock().clone();
+	let apic_ids = CPU_LOCAL_APIC_IDS.lock();
 	// Only cores that are online (core ids are handed out in boot order, `CPU_ONLINE` counts
 	// the finished ones): `CPU_LOCAL_APIC_IDS` lists every core from the ACPI tables, and a core
 	// that hasn't started would never acknowledge. A core that comes online later loads fresh
@@ -301,6 +311,7 @@ pub fn tlb_shootdown() {
 			);
 		}
 	}
+	drop(apic_ids);
 	while SHOOTDOWN_PENDING.load(SeqCst) != 0 {
 		spin_loop();
 	}
