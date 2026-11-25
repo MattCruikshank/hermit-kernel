@@ -46,13 +46,15 @@ mod page_range_alloc;
 mod physicalmem;
 mod virtualmem;
 
-use core::alloc::Layout;
+use core::alloc::{GlobalAlloc, Layout};
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
+use core::ops::{Deref, DerefMut};
+use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use align_address::Align;
 use free_list::{PageLayout, PageRange};
-use hermit_sync::RawInterruptSpinMutex;
+use hermit_sync::{InterruptTicketMutex, InterruptTicketMutexGuard, RawInterruptSpinMutex};
 pub use memory_addresses::{PhysAddr, VirtAddr};
 #[cfg(target_os = "none")]
 use talc::TalcLock;
@@ -73,33 +75,112 @@ use crate::arch::mm::paging::HugePageSize;
 pub use crate::arch::mm::paging::virtual_to_physical;
 use crate::arch::mm::paging::{BasePageSize, LargePageSize, PageSize};
 
+/// A mutex that records which core holds it, so that the heap can tell whether growing it here
+/// would wait for a lock this core already holds (ISSUE-00015). Interrupts are disabled while
+/// it is held, so "held by this core" means "held by the code we were called from".
+pub(crate) struct OwnedMutex<T> {
+	inner: InterruptTicketMutex<T>,
+	owner: AtomicU32,
+}
+
+const NO_OWNER: u32 = u32::MAX;
+
+impl<T> OwnedMutex<T> {
+	pub const fn new(value: T) -> Self {
+		Self {
+			inner: InterruptTicketMutex::new(value),
+			owner: AtomicU32::new(NO_OWNER),
+		}
+	}
+
+	pub fn lock(&self) -> OwnedMutexGuard<'_, T> {
+		let guard = self.inner.lock();
+		self.owner
+			.store(arch::kernel::core_local::core_id(), Ordering::Relaxed);
+		OwnedMutexGuard {
+			guard,
+			owner: &self.owner,
+		}
+	}
+
+	/// Whether this core holds the lock. Only valid once per-core data is set up.
+	pub fn held_by_this_core(&self) -> bool {
+		self.owner.load(Ordering::Relaxed) == arch::kernel::core_local::core_id()
+	}
+}
+
+pub(crate) struct OwnedMutexGuard<'a, T> {
+	guard: InterruptTicketMutexGuard<'a, T>,
+	owner: &'a AtomicU32,
+}
+
+impl<T> Drop for OwnedMutexGuard<'_, T> {
+	fn drop(&mut self) {
+		// Runs before `guard` is dropped, i.e. while the lock is still held.
+		self.owner.store(NO_OWNER, Ordering::Relaxed);
+	}
+}
+
+impl<T> Deref for OwnedMutexGuard<'_, T> {
+	type Target = T;
+	fn deref(&self) -> &T {
+		&self.guard
+	}
+}
+
+impl<T> DerefMut for OwnedMutexGuard<'_, T> {
+	fn deref_mut(&mut self) -> &mut T {
+		&mut self.guard
+	}
+}
+
+/// The heap allocator. `GlobalAlloc` goes through [`KernelAllocator`], which maps more heap memory
+/// when needed — outside the allocator lock (ISSUE-00015).
 #[cfg(target_os = "none")]
-#[global_allocator]
-pub(crate) static ALLOCATOR: TalcLock<RawInterruptSpinMutex, GrowingHeap> =
+pub(crate) static TALC: TalcLock<RawInterruptSpinMutex, GrowingHeap> =
 	TalcLock::new(GrowingHeap::new());
 
-/// Physical memory backing the heap at boot. The heap grows from there on demand.
+#[cfg(target_os = "none")]
+#[global_allocator]
+pub(crate) static ALLOCATOR: KernelAllocator = KernelAllocator;
+
+/// Physical memory given to the heap at boot. The heap grows from there on demand.
 #[cfg(not(feature = "common-os"))]
 const INITIAL_HEAP_SIZE: usize = 16 << 20;
-/// Minimum amount by which the heap grows when it runs out (rounded up to 2 MiB).
-const HEAP_GROW_STEP: usize = 16 << 20;
+/// Pre-mapped memory kept beyond the heap's end, so that the heap can grow without mapping
+/// anything while the allocator is locked.
+const HEAP_HEADROOM: usize = 16 << 20;
+/// Minimum amount by which the heap grows into the headroom when it runs out.
+const HEAP_GROW_STEP: usize = 4 << 20;
 
-/// Heap source that grows the heap on demand.
+/// Set by `acquire` when the headroom ran low; the next allocation outside the lock refills it.
+#[cfg(target_os = "none")]
+static REFILL_WANTED: AtomicBool = AtomicBool::new(false);
+/// One refill at a time.
+#[cfg(target_os = "none")]
+static REFILLING: AtomicBool = AtomicBool::new(false);
+/// Set once `init` has set up the heap (before that, no refills; `core_id` may not work yet).
+#[cfg(target_os = "none")]
+static HEAP_READY: AtomicBool = AtomicBool::new(false);
+
+/// Heap source that grows the heap on demand — without taking any other lock.
 ///
-/// At boot, the heap's whole *virtual* range is reserved (as large as the available memory), but
-/// only [`INITIAL_HEAP_SIZE`] of it is backed by frames. When talc runs out, [`Source::acquire`]
-/// maps more frames at the end of the heap (2 MiB pages where possible, 4 KiB pages otherwise)
-/// and extends the heap. The heap never shrinks. Memory that the heap doesn't use stays
-/// available to `mmap` (e.g. Wasm linear memories), instead of a fixed share being set aside.
+/// The heap's whole *virtual* range is reserved at boot (as large as the available memory).
+/// Frames are mapped only for the part in use plus [`HEAP_HEADROOM`]. When talc runs out,
+/// [`Source::acquire`] — which runs with the allocator locked — merely extends the heap into the
+/// already-mapped headroom. Mapping more headroom ([`refill`]) needs the frame allocator and the
+/// page tables, whose free lists may themselves allocate from the heap (`SmallVec` spill), so it
+/// runs *outside* the allocator lock and never on a core that holds a free-list lock. Taking
+/// those locks under the allocator lock could deadlock (ISSUE-00015).
 ///
-/// `acquire` runs with the allocator locked, so it must not allocate from the heap. It uses
-/// [`FrameAlloc`] and the page tables, which don't — as long as the free lists stay within their
-/// inline capacity (see `physicalmem.rs`).
+/// The heap never shrinks (ISSUE-00016). Memory the heap doesn't use stays available to `mmap`.
 #[derive(Debug)]
 pub(crate) struct GrowingHeap {
 	/// The heap end as returned by talc's `claim`/`extend`.
 	heap_end: Option<NonNull<u8>>,
-	/// End of the mapped (frame-backed) part of the heap.
+	/// End of the part given to talc (page aligned).
+	talc_end: usize,
+	/// End of the mapped (frame-backed) part: `talc_end..mapped_end` is the headroom.
 	mapped_end: usize,
 	/// End of the heap's virtual reservation.
 	limit: usize,
@@ -112,6 +193,7 @@ impl GrowingHeap {
 	pub const fn new() -> Self {
 		Self {
 			heap_end: None,
+			talc_end: 0,
 			mapped_end: 0,
 			limit: 0,
 		}
@@ -144,28 +226,143 @@ fn map_heap_range(virt: VirtAddr, size: usize) -> usize {
 #[cfg(target_os = "none")]
 unsafe impl Source for GrowingHeap {
 	fn acquire<B: Binning>(talc: &mut Talc<Self, B>, layout: Layout) -> Result<(), ()> {
+		// Runs with the allocator locked: no frame allocation, no page-table changes, no locks.
 		let Some(heap_end) = talc.source.heap_end else {
 			return Err(());
 		};
-		let large = LargePageSize::SIZE as usize;
-		// Room for the request plus talc's bookkeeping, at least one grow step.
-		let need = layout.size() + layout.align() + 256;
-		let grow = need.max(HEAP_GROW_STEP).align_up(large);
-		let start = talc.source.mapped_end;
-		let grow = grow.min(talc.source.limit.saturating_sub(start));
-		if grow == 0 {
+		let headroom = talc.source.mapped_end - talc.source.talc_end;
+		// Room for the request plus talc's bookkeeping.
+		let need = (layout.size() + layout.align() + 256).align_up(BasePageSize::SIZE as usize);
+		if need > headroom {
+			// The caller (`KernelAllocator`) maps more and retries.
+			REFILL_WANTED.store(true, Ordering::Relaxed);
 			return Err(());
 		}
-		let mapped = map_heap_range(VirtAddr::new(start as u64), grow);
-		if mapped == 0 {
-			return Err(());
-		}
-		talc.source.mapped_end = start + mapped;
-		// SAFETY: `heap_end` is talc's current heap end; the range up to `mapped_end` is now
-		// mapped and owned by the heap.
-		let new_end = unsafe { talc.extend(heap_end, talc.source.mapped_end as *mut u8) };
+		let give = need.max(HEAP_GROW_STEP).min(headroom);
+		talc.source.talc_end += give;
+		// SAFETY: `heap_end` is talc's current heap end; `..talc_end` is mapped and unused.
+		let new_end = unsafe { talc.extend(heap_end, talc.source.talc_end as *mut u8) };
 		talc.source.heap_end = Some(new_end);
+		if headroom - give < HEAP_HEADROOM / 2 {
+			REFILL_WANTED.store(true, Ordering::Relaxed);
+		}
 		Ok(())
+	}
+}
+
+#[cfg(target_os = "none")]
+enum Refill {
+	/// More memory was mapped.
+	Done,
+	/// Another core is refilling right now.
+	Busy,
+	/// Not possible here (inside a free-list lock, heap not ready, limit or memory exhausted).
+	No,
+}
+
+/// Maps more headroom: at least `min_extra` bytes, and up to [`HEAP_HEADROOM`] in total.
+/// Only called by [`KernelAllocator`], never with the allocator lock held.
+#[cfg(target_os = "none")]
+fn refill(min_extra: usize) -> Refill {
+	if !HEAP_READY.load(Ordering::Acquire)
+		|| physicalmem::held_by_this_core()
+		|| virtualmem::held_by_this_core()
+	{
+		return Refill::No;
+	}
+	if REFILLING
+		.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+		.is_err()
+	{
+		return Refill::Busy;
+	}
+	// Interrupts off: an interrupt handler on this core must not find `REFILLING` set by the code
+	// it interrupted (it would spin on `Busy` forever).
+	let mapped = hermit_sync::without_interrupts(|| {
+		let (start, headroom, limit) = {
+			let talc = TALC.lock();
+			let s = &talc.source;
+			(s.mapped_end, s.mapped_end - s.talc_end, s.limit)
+		};
+		let want = HEAP_HEADROOM
+			.saturating_sub(headroom)
+			.max(min_extra)
+			.align_up(LargePageSize::SIZE as usize)
+			.min(limit - start);
+		if want == 0 {
+			return 0;
+		}
+		// The free lists may allocate from the heap in here: talc's lock is free, and an
+		// allocation that would need to grow the heap fails instead of recursing (this core then
+		// holds a free-list lock, so `refill` returns `No`).
+		let mapped = map_heap_range(VirtAddr::new(start as u64), want);
+		TALC.lock().source.mapped_end = start + mapped;
+		mapped
+	});
+	REFILL_WANTED.store(false, Ordering::Relaxed);
+	REFILLING.store(false, Ordering::Release);
+	if mapped > 0 { Refill::Done } else { Refill::No }
+}
+
+/// The global allocator: talc, plus heap growth outside its lock.
+#[cfg(target_os = "none")]
+pub(crate) struct KernelAllocator;
+
+#[cfg(target_os = "none")]
+impl KernelAllocator {
+	/// After an allocation attempt: refill the headroom if it ran low, or — if the attempt
+	/// failed — map enough for `size` bytes and retry. Returns null instead of waiting wherever
+	/// waiting could deadlock; a failed allocation then aborts with an error, it never hangs.
+	#[inline]
+	fn finish(&self, ptr: *mut u8, size: usize, retry: impl Fn() -> *mut u8) -> *mut u8 {
+		if !ptr.is_null() {
+			if REFILL_WANTED.load(Ordering::Relaxed) {
+				let _ = refill(0);
+			}
+			return ptr;
+		}
+		loop {
+			match refill(size.saturating_add(4096)) {
+				Refill::Done => {
+					let ptr = retry();
+					if !ptr.is_null() {
+						return ptr;
+					}
+				}
+				// Another core is mapping memory. It doesn't wait for anything this core holds:
+				// if this core held a free-list lock, `refill` would have returned `No`.
+				Refill::Busy => {
+					core::hint::spin_loop();
+					let ptr = retry();
+					if !ptr.is_null() {
+						return ptr;
+					}
+				}
+				Refill::No => return ptr::null_mut(),
+			}
+		}
+	}
+}
+
+#[cfg(target_os = "none")]
+unsafe impl GlobalAlloc for KernelAllocator {
+	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+		let ptr = unsafe { TALC.alloc(layout) };
+		self.finish(ptr, layout.size(), || unsafe { TALC.alloc(layout) })
+	}
+
+	unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+		let ptr = unsafe { TALC.alloc_zeroed(layout) };
+		self.finish(ptr, layout.size(), || unsafe { TALC.alloc_zeroed(layout) })
+	}
+
+	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+		unsafe { TALC.dealloc(ptr, layout) }
+	}
+
+	unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+		let new = unsafe { TALC.realloc(ptr, layout, new_size) };
+		self.finish(new, new_size, || unsafe { TALC.realloc(ptr, layout, new_size) })
 	}
 }
 
@@ -184,7 +381,7 @@ pub(crate) fn claim_initial_heap() {
 	let base = (&raw mut INITIAL_HEAP).cast::<u8>();
 	let size = size_of::<InitialHeap>();
 	unsafe {
-		ALLOCATOR.lock().claim(base, size).unwrap();
+		TALC.lock().claim(base, size).unwrap();
 	}
 }
 
@@ -297,10 +494,11 @@ pub(crate) fn init() {
 		let virt_addr = VirtAddr::from(page_range.start());
 		heap_start_addr = virt_addr;
 		heap_limit = virt_addr + reserved as u64;
-		let virt_size = reserved.min(INITIAL_HEAP_SIZE);
+		// Map the initial heap plus the headroom; talc gets only the initial part.
+		let virt_size = reserved.min(INITIAL_HEAP_SIZE + HEAP_HEADROOM);
 
 		info!(
-			"Heap: {} MB backed initially, grows on demand up to {} MB, start address {:p}",
+			"Heap: {} MB mapped initially (incl. headroom), grows on demand up to {} MB, start address {:p}",
 			virt_size >> 20,
 			reserved >> 20,
 			virt_addr
@@ -377,16 +575,22 @@ pub(crate) fn init() {
 
 	let heap_end_addr = map_addr;
 
-	let size = heap_end_addr.as_usize() - heap_start_addr.as_usize();
+	let mapped_size = heap_end_addr.as_usize() - heap_start_addr.as_usize();
+	#[cfg(not(feature = "common-os"))]
+	let size = mapped_size.min(INITIAL_HEAP_SIZE);
+	#[cfg(feature = "common-os")]
+	let size = mapped_size;
 	{
-		let mut talc = ALLOCATOR.lock();
+		let mut talc = TALC.lock();
 		let heap_end = unsafe { talc.claim(heap_start_addr.as_mut_ptr(), size).unwrap() };
 		talc.source = GrowingHeap {
 			heap_end: Some(heap_end),
+			talc_end: heap_start_addr.as_usize() + size,
 			mapped_end: heap_end_addr.as_usize(),
 			limit: heap_limit.as_usize(),
 		};
 	}
+	HEAP_READY.store(true, Ordering::Release);
 
 	info!("Heap is located at {heap_start_addr:p}..{heap_end_addr:p} ({map_size} Bytes unmapped)");
 }

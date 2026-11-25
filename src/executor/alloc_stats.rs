@@ -2,7 +2,7 @@ use core::future;
 use core::task::Poll;
 
 use crate::executor::spawn;
-use crate::mm::ALLOCATOR;
+use crate::mm::TALC as ALLOCATOR;
 
 async fn print_alloc_stats() {
 	future::poll_fn(|cx| {

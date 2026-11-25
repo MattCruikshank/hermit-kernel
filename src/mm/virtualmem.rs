@@ -2,14 +2,18 @@ use core::alloc::AllocError;
 use core::fmt;
 
 use free_list::{FreeList, PageLayout, PageRange};
-use hermit_sync::InterruptTicketMutex;
 use memory_addresses::VirtAddr;
 
 use crate::mm::{PageRangeAllocator, PageRangeBox};
 
 // Inline capacity 1024: see `PHYSICAL_FREE_LIST`. Upstream: 16.
-static KERNEL_FREE_LIST: InterruptTicketMutex<FreeList<1024>> =
-	InterruptTicketMutex::new(FreeList::new());
+static KERNEL_FREE_LIST: crate::mm::OwnedMutex<FreeList<1024>> =
+	crate::mm::OwnedMutex::new(FreeList::new());
+
+/// Whether this core holds the free-list lock (see `mm::refill`).
+pub(crate) fn held_by_this_core() -> bool {
+	KERNEL_FREE_LIST.held_by_this_core()
+}
 
 pub struct PageAlloc;
 
@@ -44,6 +48,7 @@ impl PageRangeAllocator for PageAlloc {
 impl fmt::Display for PageAlloc {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let free_list = KERNEL_FREE_LIST.lock();
+		let free_list = &*free_list;
 		write!(f, "PageAlloc free list:\n{free_list}")
 	}
 }

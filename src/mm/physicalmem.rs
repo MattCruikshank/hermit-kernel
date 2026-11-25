@@ -5,7 +5,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use align_address::Align;
 use free_list::{FreeList, PageLayout, PageRange};
-use hermit_sync::InterruptTicketMutex;
 use memory_addresses::{PhysAddr, VirtAddr};
 
 #[cfg(all(target_arch = "x86_64", feature = "hermit-entry"))]
@@ -18,8 +17,13 @@ use crate::mm::{PageRangeAllocator, PageRangeBox};
 // Inline capacity 1024 (16 KiB): beyond it the list spills to the heap, and with the growing
 // heap (`mm::GrowingHeap`) a spill while the heap is exhausted would deadlock (heap growth
 // allocates frames under the allocator lock). Upstream: 16.
-static PHYSICAL_FREE_LIST: InterruptTicketMutex<FreeList<1024>> =
-	InterruptTicketMutex::new(FreeList::new());
+static PHYSICAL_FREE_LIST: crate::mm::OwnedMutex<FreeList<1024>> =
+	crate::mm::OwnedMutex::new(FreeList::new());
+
+/// Whether this core holds the free-list lock (see `mm::refill`).
+pub(crate) fn held_by_this_core() -> bool {
+	PHYSICAL_FREE_LIST.held_by_this_core()
+}
 pub static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 
 pub struct FrameAlloc;
@@ -74,6 +78,7 @@ impl PageRangeAllocator for FrameAlloc {
 impl fmt::Display for FrameAlloc {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let free_list = PHYSICAL_FREE_LIST.lock();
+		let free_list = &*free_list;
 		write!(f, "FrameAlloc free list:\n{free_list}")
 	}
 }
