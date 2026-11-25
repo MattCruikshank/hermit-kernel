@@ -107,6 +107,8 @@ pub fn boot_processor_main() -> ! {
 	}
 
 	info!("Welcome to Hermit {}", env!("CARGO_PKG_VERSION"));
+	// METAL: lets the build tooling check that this is the kernel it meant to build (build.rs).
+	println!("METAL kernel source: {}", env!("METAL_KERNEL_SOURCE"));
 	if let Some(git_version) = built_info::GIT_VERSION {
 		let dirty = if built_info::GIT_DIRTY == Some(true) {
 			" (dirty)"

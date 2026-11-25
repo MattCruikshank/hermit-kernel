@@ -9,6 +9,7 @@ use llvm_tools::LlvmTools;
 
 fn main() -> Result<()> {
 	built::write_built_file().unwrap();
+	metal_source_fingerprint()?;
 
 	if env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "x86_64"
 		&& env::var_os("CARGO_FEATURE_SMP").is_some()
@@ -93,4 +94,54 @@ fn binutil(name: &str) -> PathBuf {
 	}
 
 	PathBuf::from(exe)
+}
+
+/// METAL: a fingerprint of the kernel sources (`Cargo.toml`, `Cargo.lock`, everything under
+/// `src/`), printed at boot as `METAL kernel source: <hex>`. METAL's `xtask` computes the same
+/// value from the source it meant to build and fails if the booted kernel reports another one —
+/// so a stale kernel build can't pass for a fresh one. FNV-1a 64 over each file's relative path
+/// (with `/`), a 0 byte, its contents and a 0 byte, in sorted path order. Keep in sync with
+/// `kernel_source_hash` in METAL's `xtask/src/main.rs`.
+fn metal_source_fingerprint() -> Result<()> {
+	fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+		for entry in fs::read_dir(dir)? {
+			let path = entry?.path();
+			if path.is_dir() {
+				walk(&path, files)?;
+			} else {
+				files.push(path);
+			}
+		}
+		Ok(())
+	}
+	let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+	let mut files = vec![root.join("Cargo.toml"), root.join("Cargo.lock")];
+	walk(&root.join("src"), &mut files)?;
+	let mut entries: Vec<(String, PathBuf)> = files
+		.into_iter()
+		.filter(|f| f.exists())
+		.map(|f| {
+			let rel = f.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+			(rel, f)
+		})
+		.collect();
+	entries.sort();
+	let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+	let mut feed = |bytes: &[u8]| {
+		for b in bytes {
+			hash ^= u64::from(*b);
+			hash = hash.wrapping_mul(0x0100_0000_01b3);
+		}
+	};
+	for (rel, path) in &entries {
+		feed(rel.as_bytes());
+		feed(&[0]);
+		feed(&fs::read(path)?);
+		feed(&[0]);
+	}
+	println!("cargo:rustc-env=METAL_KERNEL_SOURCE={hash:016x}");
+	println!("cargo:rerun-if-changed=src");
+	println!("cargo:rerun-if-changed=Cargo.toml");
+	println!("cargo:rerun-if-changed=Cargo.lock");
+	Ok(())
 }
