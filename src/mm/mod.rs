@@ -176,6 +176,8 @@ static HEAP_READY: AtomicBool = AtomicBool::new(false);
 /// The heap never shrinks (ISSUE-00016). Memory the heap doesn't use stays available to `mmap`.
 #[derive(Debug)]
 pub(crate) struct GrowingHeap {
+	/// Start of the heap.
+	start: usize,
 	/// The heap end as returned by talc's `claim`/`extend`.
 	heap_end: Option<NonNull<u8>>,
 	/// End of the part given to talc (page aligned).
@@ -192,6 +194,7 @@ unsafe impl Send for GrowingHeap {}
 impl GrowingHeap {
 	pub const fn new() -> Self {
 		Self {
+			start: 0,
 			heap_end: None,
 			talc_end: 0,
 			mapped_end: 0,
@@ -302,6 +305,26 @@ fn refill(min_extra: usize) -> Refill {
 	REFILL_WANTED.store(false, Ordering::Relaxed);
 	REFILLING.store(false, Ordering::Release);
 	if mapped > 0 { Refill::Done } else { Refill::No }
+}
+
+/// Memory statistics (METAL): `[total RAM, free RAM, heap mapped, heap given to the allocator,
+/// heap in use, live heap allocations]`, in bytes except the last.
+#[cfg(target_os = "none")]
+pub(crate) fn metal_mem_info() -> [usize; 6] {
+	// Free RAM first: the free-list lock may be held while the allocator lock is taken (a list
+	// spilling to the heap), never the other way round.
+	let free = FrameAlloc::free_bytes();
+	let talc = TALC.lock();
+	let s = &talc.source;
+	let counters = talc.counters();
+	[
+		physicalmem::total_memory_size(),
+		free,
+		s.mapped_end.saturating_sub(s.start),
+		s.talc_end.saturating_sub(s.start),
+		counters.allocated_bytes,
+		counters.allocation_count,
+	]
 }
 
 /// The global allocator: talc, plus heap growth outside its lock.
@@ -584,6 +607,7 @@ pub(crate) fn init() {
 		let mut talc = TALC.lock();
 		let heap_end = unsafe { talc.claim(heap_start_addr.as_mut_ptr(), size).unwrap() };
 		talc.source = GrowingHeap {
+			start: heap_start_addr.as_usize(),
 			heap_end: Some(heap_end),
 			talc_end: heap_start_addr.as_usize() + size,
 			mapped_end: heap_end_addr.as_usize(),

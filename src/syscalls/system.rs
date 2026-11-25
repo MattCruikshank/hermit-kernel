@@ -10,6 +10,19 @@ pub extern "C" fn sys_getpagesize() -> i32 {
 	BasePageSize::SIZE.try_into().unwrap()
 }
 
+/// METAL: writes up to `len` memory statistics to `out`: total RAM, free RAM, heap mapped, heap
+/// given to the allocator, heap in use (bytes), live heap allocations. Returns how many it wrote.
+#[hermit_macro::system]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sys_metal_mem_info(out: *mut usize, len: usize) -> usize {
+	let info = crate::mm::metal_mem_info();
+	let n = len.min(info.len());
+	for (i, v) in info.into_iter().take(n).enumerate() {
+		unsafe { out.add(i).write(v) };
+	}
+	n
+}
+
 // Writes the scancodes from the keyboard buffer into the provided buffer.
 // If 'nonblock' is true, it will return immediately if there are no scancodes available,
 // otherwise it will block until at least one scancode is available.
