@@ -70,6 +70,15 @@ impl Socket {
 	}
 
 	async fn write_with_meta(&self, buffer: &[u8], meta: &UdpMetadata) -> io::Result<usize> {
+		// Fail like other systems instead of queueing a datagram smoltcp can never send: it
+		// would block this socket's send queue for good (see `NetworkInterface::can_route`).
+		{
+			let mut guard = NIC.lock();
+			let nic = guard.as_nic_mut().unwrap();
+			if !nic.can_route(&meta.endpoint.addr) {
+				return Err(Errno::Netunreach);
+			}
+		}
 		future::poll_fn(|cx| {
 			self.with(|socket| {
 				if !socket.is_open() {

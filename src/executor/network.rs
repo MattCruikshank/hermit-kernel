@@ -353,6 +353,31 @@ pub(crate) fn init() {
 }
 
 impl<'a> NetworkInterface<'a> {
+	/// Whether smoltcp can route a packet to `dst` — mirrors its private `InterfaceInner::route`:
+	/// on a local network, broadcast, multicast, or covered by an unexpired route.
+	///
+	/// smoltcp keeps an unroutable packet at the head of the socket's send queue and retries it
+	/// forever (like a missing neighbor), so one such datagram blocks the whole queue. E.g. with
+	/// only an IPv6 link-local address, every global IPv6 datagram did, and a sender waiting for
+	/// queue space waited forever (METAL ISSUE-00020).
+	#[cfg(feature = "udp")]
+	pub(crate) fn can_route(&mut self, dst: &smoltcp::wire::IpAddress) -> bool {
+		if dst.is_broadcast()
+			|| dst.is_multicast()
+			|| self.iface.ip_addrs().iter().any(|cidr| cidr.contains_addr(dst))
+		{
+			return true;
+		}
+		let now = now();
+		let mut found = false;
+		self.iface.routes_mut().update(|routes| {
+			found = routes
+				.iter()
+				.any(|route| route.cidr.contains_addr(dst) && route.expires_at.is_none_or(|t| t > now));
+		});
+		found
+	}
+
 	#[cfg(feature = "udp")]
 	pub(crate) fn create_udp_handle(&mut self) -> Result<Handle, ()> {
 		let udp_rx_buffer =
