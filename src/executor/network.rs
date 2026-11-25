@@ -78,6 +78,13 @@ impl<'a> NetworkState<'a> {
 pub(crate) type Handle = SocketHandle;
 
 static LOCAL_ENDPOINT: AtomicU16 = AtomicU16::new(0);
+/// TCP sockets closing in the background (descriptor gone); always locked after `NIC`.
+#[cfg(feature = "tcp")]
+static CLOSING_TCP: InterruptTicketMutex<Vec<Handle>> = InterruptTicketMutex::new(Vec::new());
+/// A closing socket whose peer sends nothing for this long is aborted (RST) and freed.
+#[cfg(feature = "tcp")]
+const TCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) static NIC: InterruptTicketMutex<NetworkState<'_>> =
 	InterruptTicketMutex::new(NetworkState::Missing);
 
@@ -416,8 +423,45 @@ impl<'a> NetworkInterface<'a> {
 	}
 
 	pub(crate) fn poll_common(&mut self, timestamp: Instant) -> PollResult {
-		self.iface
-			.poll(timestamp, &mut self.device, &mut self.sockets)
+		let result = self
+			.iface
+			.poll(timestamp, &mut self.device, &mut self.sockets);
+		#[cfg(feature = "tcp")]
+		self.reap_closed_tcp();
+		result
+	}
+
+	/// Closes a TCP socket whose descriptor is gone, without waiting (like POSIX `close`): the
+	/// socket finishes closing in the background and [`Self::reap_closed_tcp`] frees it.
+	///
+	/// METAL: `Drop` used to block the closing thread until the connection was fully closed,
+	/// with no timeout — so a peer that never sent its FIN (e.g. a WebSocket client that sent
+	/// Close but kept its socket open) parked that thread forever; for METAL, a network Tokio
+	/// worker, which made the whole HTTP listener unresponsive. The inactivity timeout bounds
+	/// how long a silent peer can keep the socket (and its buffers) alive.
+	#[cfg(feature = "tcp")]
+	pub(crate) fn close_tcp_in_background(&mut self, handle: Handle) {
+		let socket = self.sockets.get_mut::<tcp::Socket<'_>>(handle);
+		if socket.is_active() {
+			socket.set_timeout(Some(TCP_CLOSE_TIMEOUT));
+			socket.close();
+			CLOSING_TCP.lock().push(handle);
+		} else {
+			self.sockets.remove(handle);
+		}
+	}
+
+	/// Frees the background-closing TCP sockets that have finished.
+	#[cfg(feature = "tcp")]
+	fn reap_closed_tcp(&mut self) {
+		CLOSING_TCP.lock().retain(|&handle| {
+			if self.sockets.get_mut::<tcp::Socket<'_>>(handle).is_active() {
+				true
+			} else {
+				self.sockets.remove(handle);
+				false
+			}
+		});
 	}
 
 	pub(crate) fn poll_delay(&mut self, timestamp: Instant) -> Option<Duration> {

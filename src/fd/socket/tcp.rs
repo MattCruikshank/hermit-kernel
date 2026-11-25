@@ -12,7 +12,6 @@ use smoltcp::wire::{IpEndpoint, Ipv4Address, Ipv6Address};
 
 use super::{DEFAULT_BACKLOG, SHUT_RD, SHUT_RDWR, SHUT_WR, SOMAXCONN};
 use crate::errno::Errno;
-use crate::executor::block_on;
 use crate::executor::network::{Handle, NIC, wake_network_waker};
 use crate::fd::{
 	self, Endpoint, Fd, ListenEndpoint, ObjectInterface, PollEvent, SocketOption,
@@ -75,42 +74,6 @@ impl Socket {
 		let r = f(s, cx);
 		wake_network_waker();
 		r
-	}
-
-	async fn close(&self) -> io::Result<()> {
-		self.with(|socket| {
-			if !socket.is_active() {
-				return Err(Errno::Io);
-			}
-
-			socket.close();
-			Ok(())
-		})?;
-
-		if self.handle.len() > 1 {
-			let mut guard = NIC.lock();
-			let nic = guard.as_nic_mut().unwrap();
-
-			for handle in self.handle.iter().skip(1) {
-				let socket = nic.get_mut_socket::<tcp::Socket<'_>>(*handle);
-				if socket.is_active() {
-					socket.close();
-				}
-			}
-		}
-
-		future::poll_fn(|cx| {
-			self.with(|socket| {
-				if socket.is_active() {
-					socket.register_send_waker(cx.waker());
-					socket.register_recv_waker(cx.waker());
-					Poll::Pending
-				} else {
-					Poll::Ready(Ok(()))
-				}
-			})
-		})
-		.await
 	}
 }
 
@@ -518,12 +481,15 @@ impl ObjectInterface for Socket {
 }
 
 impl Drop for Socket {
+	/// Never blocks (METAL): the connection finishes closing in the background, see
+	/// `NetworkInterface::close_tcp_in_background`.
 	fn drop(&mut self) {
-		let _ = block_on(self.close(), None);
-
 		let mut guard = NIC.lock();
+		let nic = guard.as_nic_mut().unwrap();
 		for h in self.handle.iter() {
-			guard.as_nic_mut().unwrap().destroy_socket(*h);
+			nic.close_tcp_in_background(*h);
 		}
+		drop(guard);
+		wake_network_waker();
 	}
 }
