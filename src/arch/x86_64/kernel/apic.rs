@@ -275,8 +275,13 @@ pub fn tlb_shootdown() {
 	}
 	let me = core_id();
 	let apic_ids = CPU_LOCAL_APIC_IDS.lock().clone();
+	// Only cores that are online (core ids are handed out in boot order, `CPU_ONLINE` counts
+	// the finished ones): `CPU_LOCAL_APIC_IDS` lists every core from the ACPI tables, and a core
+	// that hasn't started would never acknowledge. A core that comes online later loads fresh
+	// page tables, so it holds no stale translations.
+	let online = usize::try_from(cores).unwrap();
 	let mut targets = 0u64;
-	for (core, _) in apic_ids.iter().enumerate() {
+	for (core, _) in apic_ids.iter().enumerate().take(online) {
 		if core != usize::try_from(me).unwrap() {
 			targets |= 1 << core;
 		}

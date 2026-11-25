@@ -222,6 +222,10 @@ impl Drop for TaskStacks {
 					stacks.virt_addr,
 					stacks.total_size / BasePageSize::SIZE as usize + 4,
 				);
+				// METAL (ISSUE-00033): no core may keep a translation to these stacks once
+				// their addresses and frames can be reused. Runs in the scheduler with
+				// interrupts disabled, which the shootdown allows (waiting cores poll).
+				crate::arch::kernel::apic::tlb_shootdown();
 				let range = PageRange::from_start_len(
 					stacks.virt_addr.as_usize(),
 					stacks.total_size + 4 * BasePageSize::SIZE as usize,

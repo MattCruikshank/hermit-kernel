@@ -236,11 +236,13 @@ pub extern "C" fn sys_mprotect(ptr: *mut u8, size: usize, prot_flags: MemoryProt
 
 	let mut virt = virtual_address;
 	let mut remaining = count;
+	let mut changed_mapped = false;
 	while remaining > 0 {
 		let (run, mapped) = contiguous_pages(virt, remaining);
 		if let Some(physical_address) = mapped {
 			// Memory is already mapped: change its flags.
 			paging::map::<BasePageSize>(virt, physical_address, run, flags);
+			changed_mapped = true;
 		} else if prot_flags != MemoryProtection::None {
 			// Reserved memory becomes accessible: back it with zeroed frames. On ENOMEM, runs
 			// before this one keep their new protection.
@@ -251,6 +253,11 @@ pub extern "C" fn sys_mprotect(ptr: *mut u8, size: usize, prot_flags: MemoryProt
 		// Reserved memory that stays inaccessible stays reserved without frames.
 		virt += (run * PAGE_SIZE) as u64;
 		remaining -= run;
+	}
+	// METAL (ISSUE-00033): `paging::map` only asks other cores to flush, without waiting. Wait
+	// here, so no core keeps e.g. a writable translation to memory that's now read-only.
+	if changed_mapped {
+		crate::arch::kernel::apic::tlb_shootdown();
 	}
 	0
 }

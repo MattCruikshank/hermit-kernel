@@ -57,6 +57,9 @@ impl MappedPageBox {
 }
 
 impl Drop for MappedPageBox {
+	/// Only invalidates this core's TLB (no shootdown, METAL ISSUE-00033): `MappedPageBox` is
+	/// only used during boot, before the other cores start (APIC/MP tables), and by
+	/// `common-os`. Revisit if it's ever dropped while several cores run.
 	fn drop(&mut self) {
 		let page_count = self.pages.len().get() / BasePageSize::SIZE as usize;
 		paging::unmap::<BasePageSize>(VirtAddr::from(self.pages.start()), page_count);
