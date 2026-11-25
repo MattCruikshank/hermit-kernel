@@ -11,7 +11,6 @@ use smoltcp::time::Duration;
 use smoltcp::wire::{IpEndpoint, Ipv4Address, Ipv6Address};
 
 use super::{DEFAULT_BACKLOG, SHUT_RD, SHUT_RDWR, SHUT_WR, SOMAXCONN};
-use crate::config::DEFAULT_KEEP_ALIVE_INTERVAL;
 use crate::errno::Errno;
 use crate::executor::block_on;
 use crate::executor::network::{Handle, NIC, wake_network_waker};
@@ -349,7 +348,10 @@ impl ObjectInterface for Socket {
 		let mut guard = NIC.lock();
 		let nic = guard.as_nic_mut().map_err(|_| Errno::Io)?;
 		let socket = nic.get_mut_socket::<tcp::Socket<'_>>(connection_handle);
-		socket.set_keep_alive(Some(Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL)));
+		// No keep-alive by default (as on Linux; SO_KEEPALIVE turns it on). Enabling it here made
+		// smoltcp send a keep-alive probe immediately on every new connection — a 1-byte segment
+		// at the SYN's sequence number before any data — which made peers such as QEMU's
+		// user-mode network hold back the client's request for ~300 ms.
 		let endpoint = Endpoint::Ip(socket.remote_endpoint().unwrap());
 		let nagle_enabled = socket.nagle_enabled();
 
