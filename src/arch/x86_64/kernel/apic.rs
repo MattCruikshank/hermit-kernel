@@ -108,6 +108,9 @@ const IOAPIC_REG_TABLE: u32 = 0x0010;
 const LOCAL_APIC_VECTORS_START: u32 = 112;
 #[cfg(feature = "smp")]
 const TLB_FLUSH_INTERRUPT_NUMBER: u8 = 112;
+/// Synchronous TLB shootdown (see [`tlb_shootdown`]).
+#[cfg(feature = "smp")]
+const TLB_SHOOTDOWN_INTERRUPT_NUMBER: u8 = 113;
 #[cfg(feature = "smp")]
 const WAKEUP_INTERRUPT_NUMBER: u8 = 121;
 pub const TIMER_INTERRUPT_NUMBER: u8 = 123;
@@ -204,6 +207,105 @@ extern "x86-interrupt" fn tlb_flush_handler(stack_frame: interrupts::ExceptionSt
 	}
 	eoi();
 	swapgs(&stack_frame);
+}
+
+#[cfg(feature = "smp")]
+extern "x86-interrupt" fn tlb_shootdown_handler(stack_frame: interrupts::ExceptionStackFrame) {
+	swapgs(&stack_frame);
+	increment_irq_counter(TLB_SHOOTDOWN_INTERRUPT_NUMBER);
+	serve_tlb_shootdown();
+	eoi();
+	swapgs(&stack_frame);
+}
+
+/// Cores that still have to flush their TLB for the shootdown in progress (bit = core id).
+#[cfg(feature = "smp")]
+static SHOOTDOWN_PENDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// One shootdown at a time.
+#[cfg(feature = "smp")]
+static SHOOTDOWN_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn flush_local_tlb() {
+	// Hermit doesn't use global pages, so reloading CR3 flushes every translation.
+	let (frame, val) = Cr3::read_raw();
+	unsafe {
+		Cr3::write_raw(frame, val);
+	}
+}
+
+/// If a shootdown is waiting for this core: flush the TLB and acknowledge.
+#[cfg(feature = "smp")]
+fn serve_tlb_shootdown() {
+	use core::sync::atomic::Ordering::SeqCst;
+	let bit = 1u64 << core_id();
+	if SHOOTDOWN_PENDING.load(SeqCst) & bit != 0 {
+		flush_local_tlb();
+		SHOOTDOWN_PENDING.fetch_and(!bit, SeqCst);
+	}
+}
+
+/// Invalidates the TLB of **every** core and returns only when all have done so (METAL).
+///
+/// `paging::unmap` only invalidates the current core's TLB (`invlpg`), and Hermit never
+/// reloads page tables on a task switch, so other cores kept translations to unmapped pages for
+/// a long time: once the frames were freed and reused, those cores read and wrote memory that
+/// now belonged to someone else (Wasmtime pool slots reused across cores — METAL ISSUE-00032).
+/// Call after unmapping and **before** freeing the frames.
+///
+/// Can't deadlock: one shootdown runs at a time; a core waiting for the lock, or for the
+/// acknowledgements, keeps serving requests addressed to itself by polling (even with
+/// interrupts disabled), and other cores acknowledge from the interrupt handler or the same
+/// polling. The caller must hold no lock that another core could be spinning on with
+/// interrupts disabled (true for the memory-mapping syscalls, which hold none here).
+#[cfg(feature = "smp")]
+pub fn tlb_shootdown() {
+	use core::sync::atomic::Ordering::SeqCst;
+	flush_local_tlb();
+	let cores = arch::kernel::get_processor_count();
+	if cores <= 1 {
+		return;
+	}
+	assert!(cores <= 64, "TLB shootdown supports up to 64 cores");
+	while SHOOTDOWN_LOCK
+		.compare_exchange_weak(false, true, SeqCst, SeqCst)
+		.is_err()
+	{
+		serve_tlb_shootdown();
+		spin_loop();
+	}
+	let me = core_id();
+	let apic_ids = CPU_LOCAL_APIC_IDS.lock().clone();
+	let mut targets = 0u64;
+	for (core, _) in apic_ids.iter().enumerate() {
+		if core != usize::try_from(me).unwrap() {
+			targets |= 1 << core;
+		}
+	}
+	SHOOTDOWN_PENDING.store(targets, SeqCst);
+	unsafe {
+		_mm_mfence();
+	}
+	for (core, &apic_id) in apic_ids.iter().enumerate() {
+		if targets & (1 << core) != 0 {
+			local_apic_write(
+				IA32_X2APIC_ICR,
+				(u64::from(apic_id) << 32)
+					| APIC_ICR_LEVEL_ASSERT
+					| APIC_ICR_DELIVERY_MODE_FIXED
+					| u64::from(TLB_SHOOTDOWN_INTERRUPT_NUMBER),
+			);
+		}
+	}
+	while SHOOTDOWN_PENDING.load(SeqCst) != 0 {
+		spin_loop();
+	}
+	SHOOTDOWN_LOCK.store(false, SeqCst);
+}
+
+/// Single core: nothing to shoot down beyond the local TLB.
+#[cfg(not(feature = "smp"))]
+pub fn tlb_shootdown() {
+	flush_local_tlb();
 }
 
 extern "x86-interrupt" fn error_interrupt_handler(stack_frame: interrupts::ExceptionStackFrame) {
@@ -501,6 +603,10 @@ pub fn init() {
 			.set_stack_index(0);
 		#[cfg(feature = "smp")]
 		{
+			idt[TLB_SHOOTDOWN_INTERRUPT_NUMBER]
+				.set_handler_fn(tlb_shootdown_handler)
+				.set_stack_index(0);
+			interrupts::add_irq_name(TLB_SHOOTDOWN_INTERRUPT_NUMBER - 32, "TLB shootdown");
 			idt[TLB_FLUSH_INTERRUPT_NUMBER]
 				.set_handler_fn(tlb_flush_handler)
 				.set_stack_index(0);

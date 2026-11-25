@@ -5,6 +5,7 @@
 //! <div class="warning">These system calls are not very POSIX-like yet!</div>
 //!
 //! [sys/mman.h]: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_mman.h.html
+use alloc::vec::Vec;
 
 use core::ffi::{c_int, c_void};
 
@@ -102,7 +103,10 @@ fn map_zeroed(
 /// Unmaps the mapped pages among `count` pages starting at `virtual_address` and frees their
 /// frames. The virtual range itself stays allocated (reserved).
 fn release_frames(virtual_address: VirtAddr, count: usize) {
-	// Unmap and free the frames run by run, as the range may consist of several mappings.
+	// Unmap run by run (the range may consist of several mappings), then make sure no core
+	// still translates to the old frames, and only then free them (METAL ISSUE-00032: other
+	// cores' stale TLB entries let them use frames that had been given to someone else).
+	let mut freed = Vec::new();
 	let mut virt = virtual_address;
 	let mut remaining = count;
 	while remaining > 0 {
@@ -110,15 +114,19 @@ fn release_frames(virtual_address: VirtAddr, count: usize) {
 		if let Some(phys) = phys {
 			paging::unmap::<BasePageSize>(virt, run);
 			debug!("Unmapping {virt:X} ({run} pages) -> {phys:X}");
-
-			let frame_range =
-				PageRange::from_start_len(phys.as_u64() as usize, run * PAGE_SIZE).unwrap();
-			unsafe {
-				FrameAlloc::deallocate(frame_range);
-			}
+			freed.push(PageRange::from_start_len(phys.as_u64() as usize, run * PAGE_SIZE).unwrap());
 		}
 		virt += (run * PAGE_SIZE) as u64;
 		remaining -= run;
+	}
+	if freed.is_empty() {
+		return;
+	}
+	crate::arch::kernel::apic::tlb_shootdown();
+	for frame_range in freed {
+		unsafe {
+			FrameAlloc::deallocate(frame_range);
+		}
 	}
 }
 
