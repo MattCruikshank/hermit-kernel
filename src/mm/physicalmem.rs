@@ -15,13 +15,21 @@ use crate::env::{self, MemmapType, StartInfo};
 use crate::mm::device_alloc::DeviceAlloc;
 use crate::mm::{PageRangeAllocator, PageRangeBox};
 
-static PHYSICAL_FREE_LIST: InterruptTicketMutex<FreeList<16>> =
+// Inline capacity 1024 (16 KiB): beyond it the list spills to the heap, and with the growing
+// heap (`mm::GrowingHeap`) a spill while the heap is exhausted would deadlock (heap growth
+// allocates frames under the allocator lock). Upstream: 16.
+static PHYSICAL_FREE_LIST: InterruptTicketMutex<FreeList<1024>> =
 	InterruptTicketMutex::new(FreeList::new());
 pub static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 
 pub struct FrameAlloc;
 
 impl FrameAlloc {
+	/// Free physical memory in bytes.
+	pub fn free_bytes() -> usize {
+		PHYSICAL_FREE_LIST.lock().free_space()
+	}
+
 	/// Like [`FrameAlloc::allocate`], but the returned frames are zeroed.
 	pub fn allocate_zeroed(layout: PageLayout) -> Result<PageRange, AllocError> {
 		let range = Self::allocate(layout)?;

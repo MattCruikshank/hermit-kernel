@@ -7,7 +7,8 @@ use memory_addresses::VirtAddr;
 
 use crate::mm::{PageRangeAllocator, PageRangeBox};
 
-static KERNEL_FREE_LIST: InterruptTicketMutex<FreeList<16>> =
+// Inline capacity 1024: see `PHYSICAL_FREE_LIST`. Upstream: 16.
+static KERNEL_FREE_LIST: InterruptTicketMutex<FreeList<1024>> =
 	InterruptTicketMutex::new(FreeList::new());
 
 pub struct PageAlloc;

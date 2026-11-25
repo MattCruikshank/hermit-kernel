@@ -35,6 +35,9 @@ bitflags! {
 
 const PAGE_SIZE: usize = BasePageSize::SIZE as usize;
 
+/// Physical memory that `mmap`/`mprotect` leave free for kernel heap growth.
+const HEAP_RESERVE: usize = 32 << 20;
+
 /// Looks at up to `count` pages starting at `virtual_address` and returns how many of them,
 /// from the start, share the state of the first page, together with the first page's frame.
 ///
@@ -68,6 +71,12 @@ fn map_zeroed(
 	count: usize,
 	flags: PageTableEntryFlags,
 ) -> Result<(), Errno> {
+	// Keep a reserve for the kernel heap, which grows on demand (`mm::GrowingHeap`): if mappings
+	// (e.g. Wasm linear memories) could take all frames, the next heap allocation that needs to
+	// grow the heap would fail, and a failed heap allocation aborts.
+	if FrameAlloc::free_bytes() < count * PAGE_SIZE + HEAP_RESERVE {
+		return Err(Errno::Nomem);
+	}
 	let mut done = 0;
 	let mut chunk = count;
 	while done < count {
