@@ -516,10 +516,19 @@ fn resolve(
 	}
 
 	let query = |name: &str, query: DnsQueryType| {
-		let mut guard = NIC.lock();
-		let nic = guard.as_nic_mut().unwrap();
-		let query = nic.start_query(name, query).unwrap();
-		nic.poll_common(network::now());
+		let query = {
+			let mut guard = NIC.lock();
+			let nic = guard.as_nic_mut().unwrap();
+			let query = nic.start_query(name, query).unwrap();
+			nic.poll_common(network::now());
+			query
+		};
+		// Polling the interface directly sends the query but bypasses the network task, so its
+		// wake-up timer still reflects the state before the query (e.g. a DHCP renewal hours
+		// away). If the first packet is lost, the retransmit (due in ~1 s) never happens and
+		// the query times out after 10 s whenever something else next polls the network.
+		// Wake the network task so it re-arms its timer for the query's retransmissions.
+		network::wake_network_waker();
 		query
 	};
 
