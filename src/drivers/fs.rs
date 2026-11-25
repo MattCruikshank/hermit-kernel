@@ -37,6 +37,9 @@ use crate::errno::Errno;
 use crate::fs::virtio_fs::{self, Rsp, RspHeader, VirtioFsError, VirtioFsInterface};
 use crate::mm::device_alloc::DeviceAlloc;
 
+/// How long a request waits for virtiofsd's reply (METAL).
+const REPLY_TIMEOUT_US: u64 = 10_000_000;
+
 type FsDevCfg = super::virtio::DevCfg<VirtioFsDriver>;
 
 /// Virtio file system driver struct.
@@ -233,9 +236,17 @@ impl VirtioFsDriver {
 		// would wait for the device and then for the other cores, with interrupts
 		// disabled, and no other task could run on these cores in the meantime.
 		driver.lock().vqueues[1].dispatch(buffer_tkn, false, BufferType::Direct)?;
+		// METAL: wait with a deadline. A dead or stuck virtiofsd used to spin this thread
+		// forever. On timeout the request stays queued: its buffers belong to the queue's
+		// token and are never freed (leaked), so a late reply can't write to freed memory.
+		let deadline = crate::arch::kernel::processor::get_timer_ticks() + REPLY_TIMEOUT_US;
 		let mut transfer_result = loop {
 			if let Some(tkn) = driver.lock().take_used(rsp_addr) {
 				break tkn;
+			}
+			if crate::arch::kernel::processor::get_timer_ticks() > deadline {
+				error!("virtio-fs: no reply within {} s; giving up on this request", REPLY_TIMEOUT_US / 1_000_000);
+				return Err(VirtioFsError::IOError(Errno::Timedout));
 			}
 			hint::spin_loop();
 		};

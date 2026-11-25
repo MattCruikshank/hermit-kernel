@@ -129,6 +129,20 @@ pub unsafe extern "C" fn sys_unlink(name: *const c_char) -> i32 {
 	fs::unlink(name).map_or_else(|e| -i32::from(e), |()| 0)
 }
 
+/// Renames a file or directory (METAL; on one mounted file system).
+#[hermit_macro::system(errno)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sys_rename(from: *const c_char, to: *const c_char) -> i32 {
+	let Ok(from) = unsafe { CStr::from_ptr(from) }.to_str() else {
+		return -i32::from(Errno::Inval);
+	};
+	let Ok(to) = unsafe { CStr::from_ptr(to) }.to_str() else {
+		return -i32::from(Errno::Inval);
+	};
+
+	fs::rename(from, to).map_or_else(|e| -i32::from(e), |()| 0)
+}
+
 #[hermit_macro::system(errno)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_mkdir(name: *const c_char, mode: u32) -> i32 {

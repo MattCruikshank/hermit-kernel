@@ -107,6 +107,11 @@ pub(crate) trait VfsNode: Send + Sync + fmt::Debug {
 		Err(Errno::Nosys)
 	}
 
+	/// Renames `from` to `to` (both relative to this node; METAL).
+	fn traverse_rename(&self, _from: &str, _to: &str) -> io::Result<()> {
+		Err(Errno::Nosys)
+	}
+
 	/// Opens a file
 	fn traverse_open(
 		&self,
@@ -211,6 +216,16 @@ impl Filesystem {
 		let path = path.strip_prefix('/').unwrap_or(path);
 
 		self.root.traverse_unlink(path)
+	}
+
+	/// Renames a file or directory (within one mounted file system).
+	pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+		debug!("Rename {from} to {to}");
+
+		let from = from.strip_prefix('/').unwrap_or(from);
+		let to = to.strip_prefix('/').unwrap_or(to);
+
+		self.root.traverse_rename(from, to)
 	}
 
 	/// Remove directory given by path
@@ -419,6 +434,13 @@ pub fn create_file(name: &str, data: &'static [u8], mode: AccessPermission) -> i
 pub fn remove_dir(path: &str) -> io::Result<()> {
 	with_relative_filename(path, |path| {
 		FILESYSTEM.get().ok_or(Errno::Inval)?.rmdir(path)
+	})
+}
+
+/// Renames `from` to `to` (METAL; both on the same mounted file system, else EXDEV).
+pub fn rename(from: &str, to: &str) -> io::Result<()> {
+	with_relative_filename(from, |from| {
+		with_relative_filename(to, |to| FILESYSTEM.get().ok_or(Errno::Inval)?.rename(from, to))
 	})
 }
 

@@ -497,6 +497,27 @@ pub(crate) mod ops {
 	}
 
 	#[derive(Debug)]
+	pub(crate) struct Rename;
+
+	impl Op for Rename {
+		const OP_CODE: fuse_opcode = fuse_opcode::FUSE_RENAME;
+		type InStruct = fuse_rename_in;
+		type InPayload = [u8];
+		type OutStruct = ();
+		type OutPayload = ();
+	}
+
+	impl Rename {
+		/// Renames `old_name` in directory `old_parent` to `new_name` in `new_parent`.
+		pub(crate) fn create(old_parent: u64, old_name: CString, new_parent: u64, new_name: CString) -> (Cmd<Self>, u32) {
+			let mut names = old_name.into_bytes_with_nul();
+			names.extend_from_slice(new_name.as_bytes_with_nul());
+			let cmd = Cmd::with_boxed_slice(old_parent, fuse_rename_in { newdir: new_parent }, names.into_boxed_slice());
+			(cmd, 0)
+		}
+	}
+
+	#[derive(Debug)]
 	pub(crate) struct Lookup;
 
 	impl Op for Lookup {
@@ -705,6 +726,14 @@ fn lookup_attr(path: &CStr) -> io::Result<(u64, fuse_attr)> {
 /// virtiofsd resolves the names of `unlink`, `rmdir` and `mkdir` with `*at`
 /// system calls relative to the parent node, so an absolute name below the
 /// root node refers to the root of the host.
+/// A FUSE reply's error field (0 or -errno) as a result (METAL: unlink and rmdir ignored it).
+fn fuse_result(error: i32) -> io::Result<()> {
+	if error == 0 {
+		return Ok(());
+	}
+	Err(Errno::try_from(-error).unwrap_or(Errno::Io))
+}
+
 fn resolve_parent(path: &CStr) -> io::Result<(u64, CString)> {
 	let path = path.to_str().map_err(|_| Errno::Inval)?;
 	let path = path.trim_end_matches('/');
@@ -737,6 +766,10 @@ struct VirtioFsFileHandleInner {
 	fuse_nid: Option<u64>,
 	fuse_fh: Option<u64>,
 	offset: usize,
+	/// Opened with O_APPEND: every write goes to the current end of the file (METAL). FUSE
+	/// leaves this to the client (Linux's FUSE client writes at the file size); writing at
+	/// `offset` overwrote the start of the file.
+	append: bool,
 }
 
 impl VirtioFsFileHandleInner {
@@ -745,6 +778,7 @@ impl VirtioFsFileHandleInner {
 			fuse_nid: None,
 			fuse_fh: None,
 			offset: 0,
+			append: false,
 		}
 	}
 
@@ -928,6 +962,12 @@ impl Write for VirtioFsFileHandleInner {
 		let nid = self.fuse_nid.ok_or(Errno::Io)?;
 		let fh = self.fuse_fh.ok_or(Errno::Io)?;
 
+		if self.append {
+			let (cmd, rsp_payload_len) = ops::Getattr::create(nid, fh, FUSE_GETATTR_FH);
+			let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len)?;
+			self.offset = usize::try_from(rsp.headers.op_header.attr.size).map_err(|_| Errno::Fbig)?;
+		}
+
 		let truncated_buf = Box::<[u8]>::from(&buf[..truncated_len]);
 		let (cmd, rsp_payload_len) = ops::Write::create(nid, fh, truncated_buf, self.offset as u64);
 		let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len)?;
@@ -1093,7 +1133,10 @@ impl ObjectInterface for VirtioFsDirectoryHandle {
 			return Err(Errno::Noent);
 		}
 
-		while (rsp.headers.out_header.len as usize) - *rsp_offset > size_of::<fuse_dirent>() {
+		// METAL: entries end at `len` (the payload), not at `out_header.len`, which includes the
+		// 16-byte reply header — reading past the payload parsed garbage (and panicked on an
+		// unknown file type). Every entry and its name must fit in the payload.
+		while *rsp_offset + size_of::<fuse_dirent>() <= len {
 			let dirent = unsafe {
 				&*rsp
 					.payload
@@ -1103,6 +1146,9 @@ impl ObjectInterface for VirtioFsDirectoryHandle {
 					.byte_add(*rsp_offset)
 					.cast::<fuse_dirent>()
 			};
+			if *rsp_offset + size_of::<fuse_dirent>() + dirent.namelen as usize > len {
+				break;
+			}
 
 			let name = unsafe {
 				slice::from_raw_parts(dirent.name.as_ptr().cast::<u8>(), dirent.namelen as usize)
@@ -1111,7 +1157,7 @@ impl ObjectInterface for VirtioFsDirectoryHandle {
 				buf,
 				buf_offset,
 				dirent.ino,
-				(dirent.type_ as u8).try_into().unwrap(),
+				(dirent.type_ as u8).try_into().unwrap_or(crate::fs::FileType::Unknown),
 				name,
 			) else {
 				if buf_offset == 0 {
@@ -1380,6 +1426,7 @@ impl VfsNode for VirtioFsDirectory {
 			file_guard.fuse_fh = Some(rsp.headers.op_header.fh);
 		}
 
+		file_guard.append = opt.contains(OpenOption::O_APPEND);
 		drop(file_guard);
 
 		Ok(Arc::new(async_lock::RwLock::new(file.into())))
@@ -1392,8 +1439,17 @@ impl VfsNode for VirtioFsDirectory {
 		let (cmd, rsp_payload_len) = ops::Unlink::create(parent, name);
 		let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len)?;
 		trace!("unlink answer {rsp:?}");
+		fuse_result(rsp.headers.out_header.error)
+	}
 
-		Ok(())
+	fn traverse_rename(&self, from: &str, to: &str) -> io::Result<()> {
+		let from = self.traversal_path(from);
+		let to = self.traversal_path(to);
+		let (old_parent, old_name) = resolve_parent(&from)?;
+		let (new_parent, new_name) = resolve_parent(&to)?;
+		let (cmd, rsp_payload_len) = ops::Rename::create(old_parent, old_name, new_parent, new_name);
+		let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len)?;
+		fuse_result(rsp.headers.out_header.error)
 	}
 
 	fn traverse_rmdir(&self, path: &str) -> io::Result<()> {
@@ -1403,8 +1459,7 @@ impl VfsNode for VirtioFsDirectory {
 		let (cmd, rsp_payload_len) = ops::Rmdir::create(parent, name);
 		let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len)?;
 		trace!("rmdir answer {rsp:?}");
-
-		Ok(())
+		fuse_result(rsp.headers.out_header.error)
 	}
 
 	fn traverse_mkdir(&self, path: &str, mode: AccessPermission) -> io::Result<()> {
@@ -1429,7 +1484,14 @@ pub(crate) fn init() {
 	};
 
 	let (cmd, rsp_payload_len) = ops::Init::create();
-	let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len).unwrap();
+	let rsp = match VirtioFsDriver::send_command(cmd, rsp_payload_len) {
+		Ok(rsp) => rsp,
+		Err(e) => {
+			// METAL: a misbehaving virtiofsd skips the mount instead of panicking (aborting the VM).
+			error!("virtio-fs: not mounted: {:?}", Errno::from(e));
+			return;
+		}
+	};
 	trace!("virtio-fs init answer: {rsp:?}");
 
 	let mount_point = driver.lock().get_mount_point();
@@ -1448,7 +1510,7 @@ pub(crate) fn init() {
 				mount_point.as_str(),
 				Box::new(VirtioFsDirectory::new("/".to_owned())),
 			)
-			.expect("Mount failed. Invalid mount_point?");
+			.unwrap_or_else(|e| error!("virtio-fs: mount failed: {e:?}"));
 		return;
 	}
 
@@ -1457,7 +1519,14 @@ pub(crate) fn init() {
 	// Flag 0x10000 for O_DIRECTORY might not be necessary
 	let (mut cmd, rsp_payload_len) = ops::Open::create(fuse_nid, 0x10000);
 	cmd.headers.in_header.opcode = fuse_opcode::FUSE_OPENDIR as u32;
-	let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len).unwrap();
+	let rsp = match VirtioFsDriver::send_command(cmd, rsp_payload_len) {
+		Ok(rsp) => rsp,
+		Err(e) => {
+			// METAL: a misbehaving virtiofsd skips the mount instead of panicking (aborting the VM).
+			error!("virtio-fs: not mounted: {:?}", Errno::from(e));
+			return;
+		}
+	};
 	let fuse_fh = rsp.headers.op_header.fh;
 
 	// Linux seems to allocate a single page to store the dirfile
@@ -1467,7 +1536,14 @@ pub(crate) fn init() {
 	// read content of the directory
 	let (mut cmd, rsp_payload_len) = ops::Read::create(fuse_nid, fuse_fh, len, 0);
 	cmd.headers.in_header.opcode = fuse_opcode::FUSE_READDIR as u32;
-	let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len).unwrap();
+	let rsp = match VirtioFsDriver::send_command(cmd, rsp_payload_len) {
+		Ok(rsp) => rsp,
+		Err(e) => {
+			// METAL: a misbehaving virtiofsd skips the mount instead of panicking (aborting the VM).
+			error!("virtio-fs: not mounted: {:?}", Errno::from(e));
+			return;
+		}
+	};
 
 	let len: usize = if rsp.headers.out_header.len as usize - size_of::<fuse_out_header>()
 		>= usize::try_from(len).unwrap()
@@ -1477,7 +1553,10 @@ pub(crate) fn init() {
 		(rsp.headers.out_header.len as usize) - size_of::<fuse_out_header>()
 	};
 
-	assert!(len > size_of::<fuse_dirent>(), "virtio-fs no new dirs");
+	if len <= size_of::<fuse_dirent>() {
+		error!("virtio-fs: empty root directory reply; not mounted");
+		return;
+	}
 
 	let mut entries: Vec<String> = Vec::new();
 	while (rsp.headers.out_header.len as usize) - offset > size_of::<fuse_dirent>() {
@@ -1505,7 +1584,14 @@ pub(crate) fn init() {
 	}
 
 	let (cmd, rsp_payload_len) = ops::Release::create(fuse_nid, fuse_fh);
-	VirtioFsDriver::send_command(cmd, rsp_payload_len).unwrap();
+	match VirtioFsDriver::send_command(cmd, rsp_payload_len) {
+		Ok(rsp) => rsp,
+		Err(e) => {
+			// METAL: a misbehaving virtiofsd skips the mount instead of panicking (aborting the VM).
+			error!("virtio-fs: not mounted: {:?}", Errno::from(e));
+			return;
+		}
+	};
 
 	// remove predefined directories
 	entries.retain(|x| x != ".");
@@ -1519,7 +1605,14 @@ pub(crate) fn init() {
 	for entry in entries {
 		let i_cstr = CString::new(entry.as_str()).unwrap();
 		let (cmd, rsp_payload_len) = ops::Lookup::create(FUSE_ROOT_ID, i_cstr);
-		let rsp = VirtioFsDriver::send_command(cmd, rsp_payload_len).unwrap();
+		let rsp = match VirtioFsDriver::send_command(cmd, rsp_payload_len) {
+		Ok(rsp) => rsp,
+		Err(e) => {
+			// METAL: a misbehaving virtiofsd skips the mount instead of panicking (aborting the VM).
+			error!("virtio-fs: not mounted: {:?}", Errno::from(e));
+			return;
+		}
+	};
 
 		let attr = FileAttr::from(rsp.headers.op_header.attr);
 		if attr.st_mode.contains(AccessPermission::S_IFDIR) {
@@ -1529,7 +1622,7 @@ pub(crate) fn init() {
 				.get()
 				.unwrap()
 				.mount(&path, Box::new(VirtioFsDirectory::new(path.clone())))
-				.expect("Mount failed. Invalid mount_point?");
+				.unwrap_or_else(|e| error!("virtio-fs: mount failed: {e:?}"));
 		} else {
 			warn!("virtio-fs don't mount {entry}. It isn't a directory!");
 		}

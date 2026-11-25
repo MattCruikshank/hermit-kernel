@@ -604,6 +604,24 @@ impl VfsNode for MemDirectory {
 		)
 	}
 
+	fn traverse_rename(&self, from: &str, to: &str) -> io::Result<()> {
+		block_on(
+			async {
+				let (from_first, from_rest) = from.split_once("/").unwrap_or((from, ""));
+				let (to_first, to_rest) = to.split_once("/").unwrap_or((to, ""));
+				// Only within one child (e.g. a mount); renaming in-memory entries or across
+				// mounts isn't supported.
+				if from_first != to_first || from_rest.is_empty() || to_rest.is_empty() {
+					return Err(Errno::Xdev);
+				}
+				let inner = self.inner.read().await;
+				let directory = inner.get(from_first).ok_or(Errno::Noent)?;
+				directory.traverse_rename(from_rest, to_rest)
+			},
+			None,
+		)
+	}
+
 	fn traverse_unlink(&self, path: &str) -> io::Result<()> {
 		block_on(
 			async {
