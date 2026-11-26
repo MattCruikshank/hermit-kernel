@@ -234,6 +234,50 @@ where
 	Ok(())
 }
 
+/// METAL (ISSUE-00016): unmaps the heap's pages in `virt..virt + len` — at most one 2 MiB block,
+/// not crossing a 2 MiB boundary — and frees their frames, after making sure no core still
+/// translates to them (TLB shootdown, ISSUE-00032). Handles both a 2 MiB page and 4 KiB pages.
+/// Never allocates (the caller holds the heap's refill flag: an allocation that had to wait for
+/// a refill would wait for itself). Returns the bytes freed.
+pub fn release_heap_block(virt: VirtAddr, len: usize) -> usize {
+	let large = LargePageSize::SIZE as usize;
+	let base = BasePageSize::SIZE as usize;
+	debug_assert!(len <= large && (virt.as_u64() as usize % large) + len <= large);
+	let mut pt = unsafe { identity_mapped_page_table() };
+	if len == large && virt.as_u64() % LargePageSize::SIZE == 0 {
+		let page = Page::<LargePageSize>::containing_address(virt.into());
+		if let Ok((frame, flush)) = Mapper::<LargePageSize>::unmap(&mut pt, page) {
+			flush.flush();
+			crate::arch::kernel::apic::tlb_shootdown();
+			let range =
+				free_list::PageRange::from_start_len(frame.start_address().as_u64() as usize, large)
+					.unwrap();
+			unsafe { FrameAlloc::deallocate(range) };
+			return large;
+		}
+	}
+	// 4 KiB pages (or nothing mapped): remember the frames, shoot down, then free them.
+	let mut frames = [0u64; 512];
+	let mut n = 0;
+	for i in 0..len / base {
+		let page = Page::<BasePageSize>::containing_address((virt + (i * base) as u64).into());
+		if let Ok((frame, flush)) = Mapper::<BasePageSize>::unmap(&mut pt, page) {
+			flush.flush();
+			frames[n] = frame.start_address().as_u64();
+			n += 1;
+		}
+	}
+	if n == 0 {
+		return 0;
+	}
+	crate::arch::kernel::apic::tlb_shootdown();
+	for &frame in &frames[..n] {
+		let range = free_list::PageRange::from_start_len(frame as usize, base).unwrap();
+		unsafe { FrameAlloc::deallocate(range) };
+	}
+	n * base
+}
+
 pub fn identity_map<S>(phys_addr: PhysAddr)
 where
 	S: PageSize + fmt::Debug,

@@ -152,10 +152,21 @@ const INITIAL_HEAP_SIZE: usize = 16 << 20;
 const HEAP_HEADROOM: usize = 16 << 20;
 /// Minimum amount by which the heap grows into the headroom when it runs out.
 const HEAP_GROW_STEP: usize = 4 << 20;
+/// A free tail at the top of the heap larger than this goes back to the headroom (keeping one
+/// [`HEAP_GROW_STEP`] of it in the heap). ISSUE-00016.
+const HEAP_GIVE_BACK: usize = 8 << 20;
+/// Headroom beyond [`HEAP_HEADROOM`] by more than this is unmapped and its frames freed (so
+/// `mmap` can have them), down to [`HEAP_HEADROOM`]. Hysteresis: a heap breathing around one
+/// size doesn't map and unmap all the time.
+const HEAP_TRIM_ABOVE: usize = 16 << 20;
 
 /// Set by `acquire` when the headroom ran low; the next allocation outside the lock refills it.
 #[cfg(target_os = "none")]
 static REFILL_WANTED: AtomicBool = AtomicBool::new(false);
+/// Set by `resize` when the headroom grew too large; the next deallocation outside the lock
+/// trims it ([`trim`]).
+#[cfg(target_os = "none")]
+static TRIM_WANTED: AtomicBool = AtomicBool::new(false);
 /// One refill at a time.
 #[cfg(target_os = "none")]
 static REFILLING: AtomicBool = AtomicBool::new(false);
@@ -173,7 +184,12 @@ static HEAP_READY: AtomicBool = AtomicBool::new(false);
 /// runs *outside* the allocator lock and never on a core that holds a free-list lock. Taking
 /// those locks under the allocator lock could deadlock (ISSUE-00015).
 ///
-/// The heap never shrinks (ISSUE-00016). Memory the heap doesn't use stays available to `mmap`.
+/// The heap shrinks from the top (ISSUE-00016): when talc frees a large tail, [`Source::resize`]
+/// — still under the allocator lock, so again touching nothing else — moves it back into the
+/// headroom, and [`trim`] (outside the lock, like [`refill`]) unmaps headroom beyond
+/// [`HEAP_HEADROOM`] and frees its frames for `mmap`. Only the free *tail* can go back: a live
+/// allocation near the top keeps everything below it. Memory never given to the heap stays
+/// available to `mmap` anyway.
 #[derive(Debug)]
 pub(crate) struct GrowingHeap {
 	/// Start of the heap.
@@ -251,6 +267,35 @@ unsafe impl Source for GrowingHeap {
 		}
 		Ok(())
 	}
+
+	/// talc tells us the free space at a heap's top grew.
+	const TRACK_HEAP_END: bool = true;
+
+	/// Under the allocator lock: give a large free tail of the main heap back to the headroom
+	/// (no unmapping here — that's [`trim`]'s, outside the lock).
+	unsafe fn resize(&mut self, chunk_base: *mut u8, heap_end: *mut u8, _is_heap_base: bool) -> *mut u8 {
+		// Only the growing heap (not the small static one claimed at boot).
+		if self.heap_end.map(NonNull::as_ptr) != Some(heap_end) {
+			return heap_end;
+		}
+		let (base, end) = (chunk_base as usize, heap_end as usize);
+		if end - base <= HEAP_GIVE_BACK {
+			return heap_end;
+		}
+		// Keep one grow step of free space; never below the initial heap.
+		let keep = (base + HEAP_GROW_STEP)
+			.align_up(BasePageSize::SIZE as usize)
+			.max(self.start + INITIAL_HEAP_SIZE);
+		if keep >= end {
+			return heap_end;
+		}
+		self.talc_end = keep;
+		self.heap_end = NonNull::new(keep as *mut u8);
+		if self.mapped_end - self.talc_end > HEAP_HEADROOM + HEAP_TRIM_ABOVE {
+			TRIM_WANTED.store(true, Ordering::Relaxed);
+		}
+		keep as *mut u8
+	}
 }
 
 #[cfg(target_os = "none")]
@@ -305,6 +350,55 @@ fn refill(min_extra: usize) -> Refill {
 	REFILL_WANTED.store(false, Ordering::Relaxed);
 	REFILLING.store(false, Ordering::Release);
 	if mapped > 0 { Refill::Done } else { Refill::No }
+}
+
+/// Unmaps the headroom beyond [`HEAP_HEADROOM`] (if it's more than [`HEAP_TRIM_ABOVE`] beyond)
+/// and frees its frames. Same rules as [`refill`]: never under the allocator lock, never on a
+/// core holding a free-list lock, one at a time with refills (`REFILLING`) — so the range it
+/// unmaps can't be extended into or mapped meanwhile. Returns the bytes freed.
+#[cfg(target_os = "none")]
+fn trim() -> usize {
+	if !HEAP_READY.load(Ordering::Acquire)
+		|| physicalmem::held_by_this_core()
+		|| virtualmem::held_by_this_core()
+	{
+		return 0;
+	}
+	if REFILLING
+		.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+		.is_err()
+	{
+		return 0;
+	}
+	let large = LargePageSize::SIZE as usize;
+	let freed = hermit_sync::without_interrupts(|| {
+		// First lower `mapped_end` (under the lock): from here on nothing extends into the range.
+		let (from, to) = {
+			let mut talc = TALC.lock();
+			let s = &mut talc.source;
+			let keep = (s.talc_end + HEAP_HEADROOM)
+				.align_up(large)
+				.max(s.start + INITIAL_HEAP_SIZE + HEAP_HEADROOM);
+			if s.mapped_end <= keep + HEAP_TRIM_ABOVE {
+				(0, 0)
+			} else {
+				let old = s.mapped_end;
+				s.mapped_end = keep;
+				(keep, old)
+			}
+		};
+		TRIM_WANTED.store(false, Ordering::Relaxed);
+		let mut freed = 0;
+		let mut at = from;
+		while at < to {
+			let block_end = (at + 1).align_up(large).min(to);
+			freed += arch::mm::paging::release_heap_block(VirtAddr::new(at as u64), block_end - at);
+			at = block_end;
+		}
+		freed
+	});
+	REFILLING.store(false, Ordering::Release);
+	freed
 }
 
 /// Memory statistics (METAL): `[total RAM, free RAM, heap mapped, heap given to the allocator,
@@ -381,11 +475,18 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 		unsafe { TALC.dealloc(ptr, layout) }
+		if TRIM_WANTED.load(Ordering::Relaxed) {
+			let _ = trim();
+		}
 	}
 
 	unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
 		let new = unsafe { TALC.realloc(ptr, layout, new_size) };
-		self.finish(new, new_size, || unsafe { TALC.realloc(ptr, layout, new_size) })
+		let new = self.finish(new, new_size, || unsafe { TALC.realloc(ptr, layout, new_size) });
+		if TRIM_WANTED.load(Ordering::Relaxed) {
+			let _ = trim();
+		}
+		new
 	}
 }
 
