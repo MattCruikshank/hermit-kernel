@@ -742,6 +742,7 @@ version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
+ "critical-section",
  "pin-project-lite",
 ]
 
@@ -1061,6 +1062,7 @@ dependencies = [
  "bit_field",
  "bitflags 2.13.2",
  "built",
+ "critical-section",
  "crossbeam-utils",
  "delegate",
  "document-features",
@@ -1070,6 +1072,7 @@ dependencies = [
  "endian-num",
  "enum_dispatch",
  "env_filter",
+ "event-listener",
  "fdt",
  "float-cmp",
  "free-list",
